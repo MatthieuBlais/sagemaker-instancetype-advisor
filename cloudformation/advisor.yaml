@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+
+  pricingEndpoint:
+    Description: Endpoint to use to connect to pricing API
+    Type: String
+    Default: "ap-south-1"
+
+  workflowName:
+    Description: Name of the step function
+    Type: String
+    Default: sagemaker-instance-type-advisor
+
+  stagingBucket:
+    Description: Name of the bucket to use with fargate and to store lambda code
+    Type: String
+
+  lambdaPackage:
+    Description: Location of the lambda code
+    Type: String
+    Default: _lambdas/instancetypeadvisor.zip
+
+Resources:
+
+  InitializeLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        S3Bucket: !Ref stagingBucket
+        S3Key: !Ref lambdaPackage
+      Description: "Prepare jobs"
+      FunctionName: instance-advisor-initialize
+      Handler: "initialize.handler"
+      MemorySize: 256
+      Role: !GetAtt [LambdaRole, Arn]
+      Runtime: python3.8
+      Timeout: 15
+      Environment:
+        Variables:
+          PRICING_ENDPOINT: !Ref pricingEndpoint
+
+  CleanupLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        S3Bucket: !Ref stagingBucket
+        S3Key: !Ref lambdaPackage
+      Description: "Delete SageMaker resources"
+      FunctionName: instance-advisor-cleanup
+      Handler: "cleanup.handler"
+      MemorySize: 128
+      Role: !GetAtt [LambdaRole, Arn]
+      Runtime: python3.8
+      Timeout: 15
+
+  RecommendLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        S3Bucket: !Ref stagingBucket
+        S3Key: !Ref lambdaPackage
+      Description: "Recommend based on load test"
+      FunctionName: instance-advisor-recommend
+      Handler: "recommend.handler"
+      MemorySize: 128
+      Role: !GetAtt [LambdaRole, Arn]
+      Runtime: python3.8
+      Timeout: 15
+
+  StatusLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        S3Bucket: !Ref stagingBucket
+        S3Key: !Ref lambdaPackage
+      Description: "Check Endpoint Status"
+      FunctionName: instance-advisor-status
+      Handler: "endpointstatus.handler"
+      MemorySize: 128
+      Role: !GetAtt [LambdaRole, Arn]
+      Runtime: python3.8
+      Timeout: 15
+
+  StateMachineWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: LogGroup
+    Properties:
+      StateMachineName: !Ref workflowName
+      DefinitionString: |-
+        {
+          "StartAt": "Generate jobs",
+          "States": {
+              "Generate jobs": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:::function:instance-advisor-initialize",
+                  "Catch":[
+                      {
+                          "ErrorEquals": ["States.ALL"],
+                          "ResultPath": "$.Error",
+                          "Next": "Fail"
+                      }
+                  ],
+                  "Next": "Response Time Analysis"
+              },
+              "Response Time Analysis": {
+                  "Type": "Map",
+                  "ItemsPath": "$.Jobs",
+                  "MaxConcurrency": 0,
+                  "Iterator": {
+                    "StartAt": "Rate Limit Handling",
+                    "States": {
+                      "Rate Limit Handling": {
+                          "Type": "Wait",
+                          "SecondsPath": "$.WaitLimit",
+                          "Next": "Create Endpoint Config"
+                      },
+                      "Create Endpoint Config": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+                          "Parameters":{
+                            "EndpointConfigName.$": "$.EndpointName",
+                            "ProductionVariants": [ 
+                              { 
+                                "InitialInstanceCount": 1,
+                                "InstanceType.$": "$.InstanceDetails.instanceName",
+                                "ModelName.$": "$.ModelName",
+                                "VariantName.$": "$.VariantName"
+                              }
+                            ]
+                          },
+                          "ResultPath": null,
+                          "Next":"Create Endpoint"
+                      },
+                      "Create Endpoint":{
+                          "Type":"Task",
+                          "Resource":"arn:aws:states:::sagemaker:createEndpoint",
+                          "Parameters":{
+                            "EndpointConfigName.$": "$.EndpointName",
+                            "EndpointName.$": "$.EndpointName"
+                          },
+                          "ResultPath": null,
+                          "Next": "Get endpoint status"
+                      },
+                      "Get endpoint status":{
+                          "Type": "Task",
+                          "Resource": "arn:aws:lambda:::function:instance-advisor-status",
+                          "Next": "If Endpoint Ready"
+                      },
+                      "If Endpoint Ready": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.EndpointStatus",
+                            "StringEquals": "InService",
+                            "Next": "Test Response Time"
+                          }
+                        ],
+                        "Default": "Wait 20s"
+                      },
+                      "Wait 20s": {
+                        "Type": "Wait",
+                        "Seconds": 20,
+                        "Next": "Get endpoint status"
+                      },
+                      "Test Response Time": {
+                          "Type": "Task",
+                          "Resource":"arn:aws:states:::states:startExecution.sync",
+                          "Parameters":{  
+                              "StateMachineArn":"arn:aws:states:::stateMachine:distributed-locust-orchestration-flow",
+                              "Input": {
+                                  "JobDetails.$": "$.DistributedLocust.JobDetails",
+                                  "Jobs.$": "$.DistributedLocust.Jobs"
+                              }
+                          },
+                          "ResultPath": null,
+                          "Next": "Clean-up"
+                      },
+                      "Clean-up": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:lambda:::function:instance-advisor-cleanup",
+                          "End": true
+                      }
+                    }
+                  },
+                  "Catch":[
+                      {
+                          "ErrorEquals":["States.ALL"],
+                          "ResultPath":"$.error",
+                          "Next":"Fail"
+                      }
+                  ],
+                  "ResultPath": null,
+                  "Next": "Recommend"
+              },
+              "Recommend": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:::function:instance-advisor-recommend",
+                  "Next": "Success"
+              },
+              "Success": {
+                  "Type": "Succeed"
+              },
+              "Fail": {
+                  "Type": "Fail"
+              }
+          }
+        }
+      RoleArn: !GetAtt "StateMachineRole.Arn"
+      StateMachineType: STANDARD
+      LoggingConfiguration:
+        Destinations:
+        - CloudWatchLogsLogGroup:
+            LogGroupArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vendedlogs/states/${workflowName}:*"
+        IncludeExecutionData: True
+        Level: "ALL"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${workflowName}"
+      RetentionInDays: 7
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${workflowName}-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+        Version: "2012-10-17"
+      Path: "/"
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutTargets'
+                  - 'events:PutRule'
+                  - 'events:DescribeRule'
+                Resource:
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+                  - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogDelivery'
+                  - 'logs:GetLogDelivery'
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource:
+                  - "*"
+        - PolicyName: sagemaker
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CreateEndpointConfig'
+                  - 'sagemaker:CreateEndpoint'
+                Resource:
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/typeadvisor-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/typeadvisor-*"
+        - PolicyName: lambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:instance-advisor-*"
+        - PolicyName: ecs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecs:DescribeTasks'
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                  - 'ecs:StopTask'
+                Resource:
+                  - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/*"
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource:
+                  - "*"
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "ml-serving-lambda-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: "2012-10-17"
+      Path: "/"
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: sagemaker
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:DeleteEndpointConfig'
+                  - 'sagemaker:DeleteEndpoint'
+                  - 'sagemaker:DescribeEndpoint'
+                Resource:
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/typeadvisor-*"
+                  - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint-config/typeadvisor-*"
+        - PolicyName: pricing
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - pricing:GetProducts
+                Resource: '*'
+        - PolicyName: s3
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:List*'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${stagingBucket}'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:HeadObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${stagingBucket}/*'
+
+  

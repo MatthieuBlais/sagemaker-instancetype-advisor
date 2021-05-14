@@ -1,91 +1,10 @@
-from pricing import SagemakerProducts
-from pricing import InstanceFilter
-import os
-import uuid
-import json
-
-
-LOCATION = os.environ.get("PRICING_LOCATION", "Asia Pacific (Singapore)")
-
-def fetch_instances(event):
-    """Fetch SageMaker Instances and filter them to meet event criteria"""
-    instances = SagemakerProducts.fetch(LOCATION)
-    event_filters = event.get("Filters", {})
-    filters = {
-        'products': instances,
-        'min_vcpu': event_filters.get("MinCPU", 0), 
-        'max_vcpu': event_filters.get("MaxCPU", float("inf")), 
-        'min_memory': event_filters.get("MinMemory", 0), 
-        'max_memory': event_filters.get("MaxCPU", float("inf")),
-        'min_gpu': event_filters.get("MinGPU", 0), 
-        'max_gpu': event_filters.get("MaxGPU", float("inf")),
-        'min_usd': event_filters.get("MinUSD", 0), 
-        'max_usd': event_filters.get("MaxUSD", float("inf")),
-        'instance_types': event_filters.get("InstanceTypes", []),
-        'max_instance_types': event_filters.get("MaxInstances", 5)
-    }
-    return InstanceFilter.apply(**filters)
-
-
-def format_endpoints(event, instances):
-    """Format test jobs for the few selected instances"""
-    jobs = []
-    test_id = uuid.uuid1().hex
-    counter = 0
-    for instance in instances:
-        instance_id = instance['instanceName'].replace(".", "")
-        endpoint_name = "perf-" + instance_id + "-" + event.get("EndpointName", event["ModelName"])
-        output_result_key = "_perftesting/" + test_id + "/" + uuid.uuid1().hex + ".json"
-        jobs.append({
-            "WaitLimit": (counter + 1)*10,
-            "EndpointName": endpoint_name,
-            "ModelName": event["ModelName"],
-            "VariantName": "ALLVARIANT",
-            "InstanceDetails": instance,
-            "ResultOutputs": {
-                "Bucket": os.environ["PERF_TEST_BUCKET"],
-                "Key": output_result_key
-            },
-            "PerfSettings": format_jobs(event, endpoint_name, output_result_key)
-        })
-        counter += 1
-    return jobs
-
-def format_jobs(event, endpoint_name, output_result_key):
-    host = os.environ["SERVING_API_HOST"] + os.environ["SERVING_API_ENDPOINT"]
-    jobs = []
-    if "Percentiles" not in event:
-        percentiles = ",".join(DEFAULT_PERCENTILES)
-    else:
-        percentiles = ",".join([str(x) for x in event['Percentiles']])
-    for settings in event.get("Settings", [{}]):
-        users = settings.get("Users", 5)
-        spawn_rate = settings.get("SpawnRate", 5)
-        test_time = settings.get("TestTime", 300)
-        jobs.append({
-            "EndpointName": endpoint_name,
-            "TestDataset": event["TestDataset"],
-            "ResultOutputs": {
-                "Bucket": os.environ["PERF_TEST_BUCKET"],
-                "Key": output_result_key
-            },
-            "JobDetails": {
-                "ClusterName": os.environ["ECS_CLUSTER_NAME"],
-                "TaskDefinition": os.environ["LOCUST_TASK_DEFINITION"],
-                "AwsRegion": os.environ["AWS_REGION"],
-                "Subnets": os.environ["CLUSTER_SUBNETS"].split(","),
-                "TaskName": os.environ["LOCUST_TASK_NAME"],
-                "Command": f"python3 driver.py -u {users} -r {spawn_rate} -t {test_time} -H {host} --output-bucket {os.environ['PERF_TEST_BUCKET']} --output-key {output_result_key} --percentiles {percentiles}".split(" ")
-            }
-        })
-
-    return jobs
-
-
 from sagemaker import Catalog, CatalogFilter
 import json
 import os
+import uuid
 import boto3
+
+os.environ["AWS_REGION"] = os.environ.get("AWS_REGION", "ap-southeast-1")
 
 class InstanceTypeAdvisor():
 
@@ -95,12 +14,14 @@ class InstanceTypeAdvisor():
     def __init__(self, event, catalog):
         """Format test jobs for the few selected instances"""
         self.advisor_id = uuid.uuid1().hex
+        advisor_shapes_key = f"{self.PREFIX}/{self.advisor_id}/shapes.json"
+        self._upload_json(event["AdvisorJob"]["StagingBucket"], advisor_shapes_key, event["AdvisorJob"]["Shapes"])
         self.jobs = []
         self.job_counter = 0
         for instance in catalog:
             instance_name = instance['instanceName'].replace(".", "")
             endpoint_name = self._format_name(instance_name, event.get("EndpointName", event["ModelName"]))
-            advisor_output_key = f"{PREFIX}/{self.advisor_id}/{instance_name}.json"
+            advisor_output_key = f"{self.PREFIX}/{self.advisor_id}/{instance_name}.json"
             self.jobs.append({
                 "WaitLimit": self._handle_throttling(self.job_counter),
                 "EndpointName": endpoint_name,
@@ -108,13 +29,12 @@ class InstanceTypeAdvisor():
                 "VariantName": "ALLVARIANT",
                 "InstanceDetails": instance,
                 "ResultOutputs": {
-                    "Bucket": os.environ["TYPE_ADVISOR_BUCKET"],
+                    "Bucket": event["AdvisorJob"]["StagingBucket"],
                     "Key": advisor_output_key
                 },
-                "PerfSettings": format_jobs(event, endpoint_name, output_result_key)
+                "DistributedLocust": self._format_advisor_job(event["AdvisorJob"], self.advisor_id + "-" + instance_name, endpoint_name, advisor_output_key, advisor_shapes_key)
             })
             self.job_counter += 1
-        return jobs
 
     def _format_name(self, instance_name, name):
         return f"{self.PREFIX}-{instance_name}-{name}"
@@ -122,43 +42,21 @@ class InstanceTypeAdvisor():
     def _handle_throttling(self, counter):
         return (counter + 1)*10
     
-    def _format_locust_job(self, locust_job, endpoint_name, output_result_key):
-        host = os.environ["SERVING_API_HOST"] + os.environ["SERVING_API_ENDPOINT"]
-        jobs = []
-        if "Percentiles" not in event:
-            percentiles = ",".join(DEFAULT_PERCENTILES)
-        else:
-            percentiles = ",".join([str(x) for x in event['Percentiles']])
-        for settings in event.get("Settings", [{}]):
-            jobs.append({
-                "EndpointName": endpoint_name,
-                "DistributedLocust": {
-                    "JobDetails": self._format_job(execution_id, "master", locust_job)
-                    "Jobs": [
-                        self._format_job(execution_id, "worker", locust_job) for _ in range(locust_job["ExpectedWorkers"])
-                    ]
-                }   
-            })
+    def _format_advisor_job(self, advisor_job, execution_id, endpoint_name, output_result_key, advisor_shapes_key):
+        advisor_job = self._prepare_locust_job(advisor_job, advisor_shapes_key, output_result_key)
+        return  {
+            "JobDetails": self._format_job(execution_id, "master", advisor_job),
+            "Jobs": [
+                self._format_job(execution_id, "worker", advisor_job) for _ in range(advisor_job["ExpectedWorkers"])
+            ]
+        }   
 
-        return jobs
-
-    def _prepare_locust_job(self, locust_job, shapes_key, output_key):
-        if "Percentiles" not in locust_job:
-            locust_job["Percentiles"] = DEFAULT_PERCENTILES
-        locust_job["OutputKey"] = output_key
-        shapes = locust_job["Users"]
-        self._upload_json(locust_job["StagingBucket"], shape_key, shapes)
-        locust_job["ShapesKey"] = shapes_key
-        return locust_job
-        
-
-    def _generate_shape(self, users, duration):
-        shapes = []
-        consec_duration = 0
-        for user in users:
-            shapes.append({"users": user, "duration": consec_duration + duration, "spawn_rate": user})
-        shapes.append({"users": 0, "duration": consec_duration + duration, "spawn_rate": 100 })
-        return shapes
+    def _prepare_locust_job(self, advisor_job, shapes_key, output_key):
+        if "Percentiles" not in advisor_job:
+            advisor_job["Percentiles"] = self.DEFAULT_PERCENTILES
+        advisor_job["OutputKey"] = output_key
+        advisor_job["ShapesKey"] = shapes_key
+        return advisor_job
 
     def _upload_json(self, bucket, key, content):
         s3 = boto3.client("s3")
@@ -219,44 +117,51 @@ def handler(event, context):
     
     print(json.dumps(event))
 
-    catalog = SageMakerCatalog(
-        event["PricingLocation"],
+    catalog = Catalog(
+        event["AdvisorJob"]["PricingLocation"],
         CatalogFilter(event.get("Filters", {})),
         os.environ.get("PRICING_ENDPOINT", "ap-south-1")
-    )
+    ).fetch()
 
-    jobs = format_endpoints(event, instances)
+    advisor = InstanceTypeAdvisor(event, catalog)
+    event["Jobs"] = advisor.jobs
 
-    event["Jobs"] = jobs
-
-    print(json.dumps(event))
+    print(json.dumps(event, indent=4))
 
     return event
 
 
-event = {
-    "PricingLocation": "Asia Pacific (Singapore)",
-    "Filters": {
-        "vCPU": { "Min": 0, "Max": 32 },
-        "Memory": { "Min": 0, "Max": 32 },
-        "GPU": { "Min": 0, "Max": 32 },
-        "Price": { "Min": 0, "Max": 32 },
-        "Instances": [],
-        "Limit": 5
-    },
-    "AdvisorJob": {
-        "ClusterName": "",
-        "TaskDefinition": "",
-        "Subnets": [],
-        "SecurityGroups": [],
-        "TaskName": "",
-        "Percentiles": "50",
-    }
-    "PassingCriteria": {
-        "RPS": 34,
-        "Percentile": "50",
-        "OrderBy": "RPS|$" 
-    }
-}
-handler(event, {})
+# event = {
+#     "EndpointName": "myendpoint",
+#     "ModelName": "mymodel",
+#     "Filters": {
+#         "vCPU": { "Min": 0, "Max": 32 },
+#         "Memory": { "Min": 0, "Max": 32 },
+#         "GPU": { "Min": 0, "Max": 32 },
+#         "Price": { "Min": 0, "Max": 32 },
+#         "Instances": [],
+#         "Limit": 5
+#     },
+#     "AdvisorJob": {
+#         "ClusterName": "",
+#         "TaskDefinition": "",
+#         "Subnets": [],
+#         "SecurityGroups": [],
+#         "TaskName": "",
+#         "Percentiles": ["50"],
+#         "PricingLocation": "Asia Pacific (Singapore)",
+#         "StagingBucket": "mlops-configs-20210509172522",
+#         "ExpectedWorkers": 1,
+#         "Shapes": [{"Users": 45, "Duration": 21}],
+#         "EndpointHost": "",
+#         "Method": "/hello",
+#         "TestDataKey": "sss"
+#     },
+#     "PassingCriteria": {
+#         "RPS": 34,
+#         "Percentile": "50",
+#         "OrderBy": "RPS|$" 
+#     }
+# }
+# handler(event, {})
 

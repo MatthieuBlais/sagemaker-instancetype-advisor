@@ -1,5 +1,6 @@
 import boto3
 import json
+import math
 
 class CatalogFilter():
 
@@ -10,7 +11,7 @@ class CatalogFilter():
         costs_filters = filters.get("Price", {})
         instances = filters.get("Instances", [])
         self.filters = {
-            "vCPU": lambda x: cpu_filters.get("Min", 0) <= x <= cpu_filters.get("Max", float("inf")),
+            "vCpu": lambda x: cpu_filters.get("Min", 0) <= x <= cpu_filters.get("Max", float("inf")),
             "memory": lambda x: memory_filters.get("Min", 0) <= x <= cpu_filters.get("Max", float("inf")),
             "gpu": lambda x: gpu_filters.get("Min", 0) <= x <= gpu_filters.get("Max", float("inf")),
             "onDemandUsdPrice": lambda x: costs_filters.get("Min", 0) <= x <= costs_filters.get("Max", float("inf")),
@@ -28,7 +29,7 @@ class CatalogFilter():
             if valid:
                 out.append(product)
         out = sorted(out, key=lambda x: x['onDemandUsdPrice'])
-        return self.limit_size(self, out)
+        return self.limit_size(out)
 
     def limit_size(self, catalog):
         """Reduce number of instance types based on distinct vCPU/memory"""
@@ -53,7 +54,7 @@ class Catalog:
         self.location = location
         self.filters = filters
 
-    def fetch(self, instances, compute_type=None):
+    def fetch(self, compute_type=None):
         """Fetch SageMaker Instance type pricing"""
         has_next_page = True
         next_token = None
@@ -61,7 +62,7 @@ class Catalog:
         while has_next_page:
             params = {
                 "ServiceCode": self.SERVICE_CODE,
-                "Filters": cls._filter(location, compute_type=compute_type)
+                "Filters": self._filter(self.location, compute_type=compute_type)
             }
             if next_token:
                 params["NextToken"] = next_token
@@ -128,7 +129,7 @@ class Endpoint():
 
     def cleanup(self):
         """Delete SageMaker endpoint and its config"""
-        sagemaker.delete_endpoint(EndpointName=self.endpoint_name)
-        sagemaker.delete_endpoint_config(EndpointConfigName=self.endpoint_name)
+        self.sagemaker.delete_endpoint(EndpointName=self.endpoint_name)
+        self.sagemaker.delete_endpoint_config(EndpointConfigName=self.endpoint_name)
         
 
