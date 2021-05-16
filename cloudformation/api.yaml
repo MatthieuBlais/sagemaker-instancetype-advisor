@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AppSync Template 
+
+Parameters:
+
+  apiName:
+    Type: String
+    Default: instance-advisor-
+
+  apiType:
+    Type: String
+    Default: EDGE
+
+  stageName:
+    Type: String
+    Default: api
+    
+  lambdaFunctionName:
+    Type: String
+    Default: instance-advisor-sagemaker-invoke
+  
+Resources:
+
+  SageMakerInvoke:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sagemaker = boto3.client('sagemaker-runtime')
+          
+          def handler(event, context):
+              print("New event", event)
+              response = {}
+              http_response = {}
+              try:
+                  result = sagemaker.invoke_endpoint(EndpointName=event['pathParameters']['endpoint_name'], Body=event['body'])
+                  http_response = {
+                      'statusCode': 200,
+                      'body': result['Body'].read(),
+                      'headers':{
+                          'Content-Type':'application/json',
+                          'Access-Control-Allow-Origin':'*'
+                      }
+                  }
+              except Exception as e:
+                  http_response = {
+                      'statusCode': 500,
+                      'body': json.dumps({ 'message': str(e) }),
+                      'headers':{
+                          'Content-Type':'application/json',
+                          'Access-Control-Allow-Origin':'*'
+                      }
+                  }
+              print("Response", json.dumps(response))
+              return http_response
+      Description: "Trigger Sagemaker endpoint"
+      FunctionName: !Ref lambdaFunctionName
+      Handler: "index.handler"
+      MemorySize: 256 
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: python3.8
+      Timeout: 5
+            
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub "${lambdaFunctionName}-role"
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+    
+  LambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${lambdaFunctionName}-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sagemaker:InvokeEndpoint'
+            Resource:
+              - !Sub "arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*"
+      Roles:
+        - !Ref LambdaRole
+
+
+  MLApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Body:
+        openapi: 3.0.1
+        info:
+          title: !Ref apiName
+          description: API Documentation
+          license:
+            name: Apache 2.0
+            url: 'http://www.apache.org/licenses/LICENSE-2.0.html'
+          version: 1.0.0
+        paths:
+          '/endpoint/{endpoint_name}':
+            post:
+              parameters:
+              - name: "endpoint_name"
+                in: "path"
+                required: true
+                schema:
+                  type: "string"
+              responses:
+                '200':
+                  description: successful operation
+                  content: {}
+              x-amazon-apigateway-integration:
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${lambdaFunctionName}/invocations"
+                httpMethod: "POST"
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+      Description: "ml-perf-test"
+      EndpointConfiguration:
+        Types:
+          - !Ref apiType
+      Name: !Ref apiName
+          
+  MLApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - MLApi
+    Properties:
+      RestApiId: !Ref MLApi
+      StageName: !Ref stageName
+          
+  MLApiRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'ML-APIGATEWAY-ROLE-${apiName}'
+      Path: /
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+              
+  MLApiPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub 'ML-APIGATEWAY-POLICY-${apiName}'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${lambdaFunctionName}"
+      Roles:
+        - !Ref MLApiRole
+        
+  LambdaApiGatewayPermissions:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - MLApi
+      - SageMakerInvoke
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${lambdaFunctionName}"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MLApi}/*"
