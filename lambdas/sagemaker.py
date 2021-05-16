@@ -3,6 +3,7 @@ import json
 import math
 
 class CatalogFilter():
+    """Filters that can be used with the SageMaker Catalog"""
 
     def __init__(self, filters):
         cpu_filters = filters.get("vCPU", {})
@@ -46,6 +47,7 @@ class CatalogFilter():
         return out
 
 class Catalog:
+    """Interface to fetch all instances types from AWS Catalog / Pricing API"""
 
     SERVICE_CODE = "AmazonSageMaker"
 
@@ -113,6 +115,7 @@ class Catalog:
 
 
 class Endpoint():
+    """Interface with SageMaker Endpoint"""
 
     FAILED_STATUS = ["OutOfService", "Failed"]
 

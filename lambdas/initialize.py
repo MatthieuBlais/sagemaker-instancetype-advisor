@@ -15,7 +15,7 @@ class InstanceTypeAdvisor():
         """Format test jobs for the few selected instances"""
         self.advisor_id = uuid.uuid1().hex
         advisor_shapes_key = f"{self.PREFIX}/{self.advisor_id}/shapes.json"
-        self._upload_json(event["AdvisorJob"]["StagingBucket"], advisor_shapes_key, event["AdvisorJob"]["Shapes"])
+        self._upload_shapes(event["AdvisorJob"]["StagingBucket"], advisor_shapes_key, event["AdvisorJob"]["Shapes"])
         self.jobs = []
         self.job_counter = 0
         for instance in catalog:
@@ -37,13 +37,16 @@ class InstanceTypeAdvisor():
             self.job_counter += 1
 
     def _format_name(self, instance_name, name):
+        """Apply naming convention"""
         return f"{self.PREFIX}-{instance_name}-{name}"
 
     def _handle_throttling(self, counter):
+        """Generate a predictable waiting time to avoid creating too many sagemaker endpoint at the same time, raising throttling exception"""
         return (counter + 1)*10
     
     def _format_advisor_job(self, advisor_job, execution_id, endpoint_name, output_result_key, advisor_shapes_key):
-        advisor_job = self._prepare_locust_job(advisor_job, advisor_shapes_key, output_result_key)
+        print(endpoint_name)
+        advisor_job = self._prepare_locust_job(advisor_job, endpoint_name, advisor_shapes_key, output_result_key)
         return  {
             "JobDetails": self._format_job(execution_id, "master", advisor_job),
             "Jobs": [
@@ -51,18 +54,27 @@ class InstanceTypeAdvisor():
             ]
         }   
 
-    def _prepare_locust_job(self, advisor_job, shapes_key, output_key):
+    def _prepare_locust_job(self, advisor_job, endpoint_name, shapes_key, output_key):
+        """Inject pre-compute parameters to initial execution input"""
         if "Percentiles" not in advisor_job:
             advisor_job["Percentiles"] = self.DEFAULT_PERCENTILES
         advisor_job["OutputKey"] = output_key
         advisor_job["ShapesKey"] = shapes_key
+        advisor_job["FormattedMethod"] = advisor_job["Method"] + f"/{endpoint_name}"
         return advisor_job
 
-    def _upload_json(self, bucket, key, content):
+    def _upload_shapes(self, bucket, key, shapes):
+        """Upload Locust load shape to S3"""
         s3 = boto3.client("s3")
-        s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(content))
+        shapes = [{
+            "users": x["Users"],
+            "duration": x["Duration"],
+            "spawn_rate": max(x["Users"], 100)
+        } for x in shapes]
+        s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(shapes))
 
     def _format_job(self, execution_id, job_type, locust_job):
+        """Prepare Fargate execution input"""
         task_key = "MasterTaskName" if job_type == "master" else "WorkerTaskName"
         command_key = "MasterCommand" if job_type == "master" else "WorkerCommand"
         return {
@@ -78,13 +90,14 @@ class InstanceTypeAdvisor():
         }
 
     def _format_command(self, locust_job, command_type):
+        """Format Docker command executed by Fargate depending on master/worker node"""
         command = [
             "python3",
             "app/main.py",
             "--host",
             locust_job["EndpointHost"],
             "--method",
-            locust_job["Method"],
+            locust_job["FormattedMethod"],
             "--client-type",
             command_type,
             "--percentiles",
@@ -114,6 +127,7 @@ class InstanceTypeAdvisor():
 
 
 def handler(event, context):
+    """Format Execution Input to be usable by the instance type advisor"""
     
     print(json.dumps(event))
 
@@ -126,42 +140,6 @@ def handler(event, context):
     advisor = InstanceTypeAdvisor(event, catalog)
     event["Jobs"] = advisor.jobs
 
-    print(json.dumps(event, indent=4))
+    print(json.dumps(event))
 
     return event
-
-
-# event = {
-#     "EndpointName": "myendpoint",
-#     "ModelName": "mymodel",
-#     "Filters": {
-#         "vCPU": { "Min": 0, "Max": 32 },
-#         "Memory": { "Min": 0, "Max": 32 },
-#         "GPU": { "Min": 0, "Max": 32 },
-#         "Price": { "Min": 0, "Max": 32 },
-#         "Instances": [],
-#         "Limit": 5
-#     },
-#     "AdvisorJob": {
-#         "ClusterName": "",
-#         "TaskDefinition": "",
-#         "Subnets": [],
-#         "SecurityGroups": [],
-#         "TaskName": "",
-#         "Percentiles": ["50"],
-#         "PricingLocation": "Asia Pacific (Singapore)",
-#         "StagingBucket": "mlops-configs-20210509172522",
-#         "ExpectedWorkers": 1,
-#         "Shapes": [{"Users": 45, "Duration": 21}],
-#         "EndpointHost": "",
-#         "Method": "/hello",
-#         "TestDataKey": "sss"
-#     },
-#     "PassingCriteria": {
-#         "RPS": 34,
-#         "Percentile": "50",
-#         "OrderBy": "RPS|$" 
-#     }
-# }
-# handler(event, {})
-

@@ -11,6 +11,11 @@ Parameters:
     Type: String
     Default: sagemaker-instance-type-advisor
 
+  distributedLocustFlow:
+    Description: Name of the Step Function orchestrating Locust on Fargate
+    Type: String
+    Default: distributed-locust-orchestration-flow
+
   stagingBucket:
     Description: Name of the bucket to use with fargate and to store lambda code
     Type: String
@@ -86,7 +91,7 @@ Resources:
     DependsOn: LogGroup
     Properties:
       StateMachineName: !Ref workflowName
-      DefinitionString: |-
+      DefinitionString: !Sub |-
         {
           "StartAt": "Generate jobs",
           "States": {
@@ -166,7 +171,7 @@ Resources:
                           "Type": "Task",
                           "Resource":"arn:aws:states:::states:startExecution.sync",
                           "Parameters":{  
-                              "StateMachineArn":"arn:aws:states:::stateMachine:distributed-locust-orchestration-flow",
+                              "StateMachineArn":"arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${distributedLocustFlow}",
                               "Input": {
                                   "JobDetails.$": "$.DistributedLocust.JobDetails",
                                   "Jobs.$": "$.DistributedLocust.Jobs"
@@ -277,6 +282,22 @@ Resources:
                   - 'lambda:InvokeFunction'
                 Resource:
                   - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:instance-advisor-*"
+        - PolicyName: sf
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:DescribeExecution'
+                  - 'states:DescribeStateMachineForExecution'
+                  - 'states:GetExecutionHistory'
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                  - 'states:StopExecution'
+                Resource:
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${distributedLocustFlow}"
         - PolicyName: ecs
           PolicyDocument:
             Statement:
@@ -299,7 +320,7 @@ Resources:
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: "ml-serving-lambda-role"
+      RoleName: !Sub "${workflowName}-lambda-role"
       AssumeRolePolicyDocument:
         Statement:
           - Action:
